@@ -16,7 +16,9 @@ go2rtc_win*
 
 .DS_Store
 
-.direnv
-flake.nix
-flake.lock
-.envrc
+website/.vitepress/cache
+website/.vitepress/dist
+
+node_modules
+package-lock.json
+CLAUDE.md
