@@ -15,24 +15,21 @@ func decryptBC(encOffset uint32, buf []byte) []byte {
 	if len(buf) == 0 {
 		return buf
 	}
+	offsetByte := byte(encOffset)
 	out := make([]byte, len(buf))
-	start := int(encOffset % 8)
-	off := byte(encOffset)
 	for i, b := range buf {
-		out[i] = b ^ bcKey[(start+i)%8] ^ off
+		out[i] = b ^ bcKey[(int(offsetByte)+i)%8] ^ offsetByte
 	}
 	return out
 }
 
 func encryptBC(encOffset uint32, buf []byte) []byte {
+	offsetByte := byte(encOffset)
 	out := make([]byte, len(buf))
-	o := byte(encOffset)
-
 	for i, b := range buf {
-		key := bcKey[(int(encOffset)+i)%len(bcKey)]
-		out[i] = b ^ key ^ o
+		key := bcKey[(int(offsetByte)+i)%8]
+		out[i] = b ^ key ^ offsetByte
 	}
-
 	return out
 }
 
