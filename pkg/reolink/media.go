@@ -171,24 +171,20 @@ func NewBCMediaPacket(data []byte) (*BCMediaPacket, error) {
 	}, nil
 }
 
-func (bc *BCConn) startStream(streamKind string) (*BCStreamReader, error) {
-	var streamCode uint8     // header stream type (neolink stream_code): 0=main, 1=sub, 0=extern
-	var previewHandle uint32 // XML Preview.handle (neolink handle): 0=main, 256=sub, 1024=extern
-	var streamType string    // XML streamType: "mainStream", "subStream", "externStream"
+// StreamParams returns streamCode, previewHandle, and streamType for a streamKind (for start/stop).
+func StreamParams(streamKind string) (streamCode uint8, previewHandle uint32, streamType string) {
 	switch streamKind {
 	case "sub":
-		streamCode = 1
-		previewHandle = 256
-		streamType = "subStream"
+		return 1, 256, "subStream"
 	case "extern":
-		streamCode = 0
-		previewHandle = 1024
-		streamType = "externStream"
+		return 0, 1024, "externStream"
 	default:
-		streamCode = 0
-		previewHandle = 0
-		streamType = "mainStream"
+		return 0, 0, "mainStream"
 	}
+}
+
+func (bc *BCConn) startStream(streamKind string, msgNum uint16) (*BCStreamReader, error) {
+	streamCode, previewHandle, streamType := StreamParams(streamKind)
 
 	hdr := Header{
 		Magic:      MagicLE,
@@ -196,6 +192,7 @@ func (bc *BCConn) startStream(streamKind string) (*BCStreamReader, error) {
 		Status:     0,
 		StreamType: streamCode,
 		Channel:    0,
+		MsgNum:     msgNum,
 		Class:      0x6414,
 	}
 
@@ -219,6 +216,28 @@ func (bc *BCConn) startStream(streamKind string) (*BCStreamReader, error) {
 	}, nil
 }
 
+// stopStream sends VIDEO_STOP (4) so the camera stops sending stream data. Fire-and-forget; call before closing.
+func stopStream(bc *BCConn, streamCode uint8, previewHandle uint32, msgNum uint16) error {
+	hdr := Header{
+		Magic:      MagicLE,
+		MessageID:  MsgIDVideoStop,
+		Status:     0,
+		StreamType: streamCode,
+		Channel:    0,
+		MsgNum:     msgNum,
+		Class:      0x6414,
+	}
+	var stopReq StopStreamReq
+	stopReq.Preview.Version = "1.1"
+	stopReq.Preview.ChannelId = "0"
+	stopReq.Preview.Handle = fmt.Sprintf("%d", previewHandle)
+	xmlBodyBytes, err := xml.Marshal(stopReq)
+	if err != nil {
+		return fmt.Errorf("marshal stop stream request: %w", err)
+	}
+	return bc.aesSend(hdr, nil, xmlBodyBytes)
+}
+
 type BCStreamReader struct {
 	conn               *BCConn
 	expectedStreamType uint8
@@ -234,6 +253,10 @@ func (r *BCStreamReader) Next() (*BCMediaPacket, error) {
 		}
 		h := msg.header
 		resp := msg.body
+		if h.MessageID == MsgIDKeepalive {
+			_ = r.conn.SendKeepaliveReply(h)
+			continue
+		}
 		if h.Status != 200 {
 			continue
 		}

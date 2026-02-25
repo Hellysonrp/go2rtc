@@ -27,7 +27,8 @@ type Header struct {
 	BodyLength uint32
 	Channel    uint8
 	Stream     uint8
-	StreamType uint8 // stream_code in neolink (BcMeta.stream_type); not the XML Preview.handle
+	StreamType uint8  // stream_code in neolink (BcMeta.stream_type); not the XML Preview.handle
+	MsgNum     uint16 // used to match replies to requests; camera echoes it back
 	Status     uint16
 	Class      uint16
 
@@ -65,15 +66,15 @@ func writeHeader(w io.Writer, h Header) (n int, err error) {
 	return w.Write(hdr)
 }
 
-func buildEncOffset(channel, stream, streamType uint8) uint32 {
-	// EncOffset layout (little-endian bytes on wire): [channel][stream][0x00][streamType]; streamType = stream_code in neolink
-	return uint32(channel) | uint32(stream)<<8 | 0<<16 | uint32(streamType)<<24
+// buildEncOffset builds the 4-byte value for wire bytes 12-15: [channel][streamType][msgNum LE] (neolink layout).
+func buildEncOffset(channel, streamType uint8, msgNum uint16) uint32 {
+	return uint32(channel) | uint32(streamType)<<8 | uint32(msgNum)<<16
 }
 
-func parseEncOffset(encOffset uint32) (channel, stream, streamType uint8) {
+func parseEncOffset(encOffset uint32) (channel, streamType uint8, msgNum uint16) {
 	channel = uint8(encOffset)
-	stream = uint8(encOffset >> 8)
-	streamType = uint8(encOffset >> 24)
+	streamType = uint8(encOffset >> 8)
+	msgNum = uint16(encOffset >> 16)
 	return
 }
 
@@ -88,10 +89,11 @@ func parseHeader(r io.Reader) (Header, error) {
 	h.MessageID = binary.LittleEndian.Uint32(buf[4:8])
 	h.BodyLength = binary.LittleEndian.Uint32(buf[8:12])
 	h.EncOffset = binary.LittleEndian.Uint32(buf[12:16])
-	channel, stream, streamType := parseEncOffset(h.EncOffset)
+	channel, streamType, msgNum := parseEncOffset(h.EncOffset)
 	h.Channel = channel
-	h.Stream = stream
+	h.Stream = 0
 	h.StreamType = streamType
+	h.MsgNum = msgNum
 	h.Status = binary.LittleEndian.Uint16(buf[16:18])
 	h.Class = binary.LittleEndian.Uint16(buf[18:20])
 

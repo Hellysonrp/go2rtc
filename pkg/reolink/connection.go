@@ -6,11 +6,14 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync/atomic"
 )
 
 const (
-	EncReqAESCam = 0xDC12 // 0xDC12 -> bytes [encrypt=0x12][unknown=0xDC]
-	maxBodySize  = 1 << 20
+	EncReqAESCam     = 0xDC12 // 0xDC12 -> bytes [encrypt=0x12][unknown=0xDC]
+	maxBodySize      = 1 << 20
+	MsgIDKeepalive   = 234   // MSG_ID_UDP_KEEP_ALIVE in neolink
+	MsgIDVideoStop   = 4     // MSG_ID_VIDEO_STOP in neolink
 )
 
 func NewBCConn(cameraIP, port, username, password string) (*BCConn, error) {
@@ -41,10 +44,16 @@ type BCConn struct {
 	aesKey          []byte
 	messageCount    uint32
 	isAuthenticated bool
+	nextMsgNum      atomic.Uint32
 }
 
 func (bc *BCConn) Close() error {
 	return bc.conn.Close()
+}
+
+// NextMessageNum returns and increments the message number for request/response matching (camera echoes it back).
+func (bc *BCConn) NextMessageNum() uint16 {
+	return uint16(bc.nextMsgNum.Add(1) - 1)
 }
 
 type BCMsg struct {
@@ -79,7 +88,7 @@ func (mr *MessageReader) Next() (BCMsg, error) {
 }
 
 func (bc *BCConn) bcSend(header Header, extension []byte, body []byte, bcEncrypt bool) error {
-	header.EncOffset = buildEncOffset(header.Channel, 0, header.StreamType)
+	header.EncOffset = buildEncOffset(header.Channel, header.StreamType, header.MsgNum)
 	if len(extension) > 0 {
 		header.PayloadOffset = uint32(len(extension))
 	}
@@ -118,6 +127,7 @@ func (bc *BCConn) login(username, password string) (ModernLoginRes, error) {
 	header.MessageID = 1
 	header.Status = EncReqAESCam
 	header.StreamType = 1
+	header.MsgNum = 0
 	header.Class = ClassLegacy20
 
 	err := bc.bcSend(header, nil, nil, false)
@@ -165,6 +175,7 @@ func (bc *BCConn) login(username, password string) (ModernLoginRes, error) {
 	header.MessageID = 1
 	header.Status = 0
 	header.StreamType = 1
+	header.MsgNum = 0
 	header.Class = ClassModern24
 
 	err = bc.bcSend(header, nil, xmlBody, true)
@@ -189,7 +200,7 @@ func (bc *BCConn) login(username, password string) (ModernLoginRes, error) {
 }
 
 func (bc *BCConn) aesSend(header Header, extension []byte, body []byte) error {
-	header.EncOffset = buildEncOffset(header.Channel, 0, header.StreamType)
+	header.EncOffset = buildEncOffset(header.Channel, header.StreamType, header.MsgNum)
 	if len(extension) > 0 {
 		header.PayloadOffset = uint32(len(extension))
 	}
@@ -208,5 +219,18 @@ func (bc *BCConn) aesSend(header Header, extension []byte, body []byte) error {
 		return fmt.Errorf("write body failed: %v", err)
 	}
 	return nil
+}
 
+// SendKeepaliveReply sends a keepalive reply (MSG_ID 234, Status 200) so the camera keeps the session alive.
+func (bc *BCConn) SendKeepaliveReply(receivedHeader Header) error {
+	reply := Header{
+		Magic:      MagicLE,
+		MessageID:  MsgIDKeepalive,
+		Status:     200,
+		Channel:    receivedHeader.Channel,
+		StreamType: receivedHeader.StreamType,
+		MsgNum:     receivedHeader.MsgNum,
+		Class:      ClassModern24,
+	}
+	return bc.aesSend(reply, nil, nil)
 }

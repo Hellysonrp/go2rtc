@@ -19,6 +19,7 @@ type Producer struct {
 	bcConn       *BCConn
 	streamReader *BCStreamReader
 	streamKind   string
+	streamMsgNum uint16 // msg_num used for start stream; needed for VIDEO_STOP in Stop()
 }
 
 func Dial(source string) (core.Producer, error) {
@@ -129,7 +130,8 @@ func (p *Producer) Start() error {
 }
 
 func (p *Producer) Stop() error {
-
+	streamCode, previewHandle, _ := StreamParams(p.streamKind)
+	_ = stopStream(p.bcConn, streamCode, previewHandle, p.streamMsgNum)
 	return nil
 }
 
@@ -154,10 +156,12 @@ func (p *Producer) hasAudioCodec(name string) bool {
 func (p *Producer) probe() error {
 	var packets int
 
-	reader, err := p.bcConn.startStream(p.streamKind)
+	msgNum := p.bcConn.NextMessageNum()
+	reader, err := p.bcConn.startStream(p.streamKind, msgNum)
 	if err != nil {
 		return err
 	}
+	p.streamMsgNum = msgNum
 	p.streamReader = reader
 
 	for packets < 30 {
