@@ -171,7 +171,8 @@ func (p *Producer) probe() error {
 		}
 		switch packet.Codec {
 		case "H264":
-			if !p.hasVideoCodec(core.CodecH264) {
+			avcc := annexb.EncodeToAVCC(packet.Data)
+			if len(avcc) >= 5 && h264.IsKeyframe(avcc) && !p.hasVideoCodec(core.CodecH264) {
 				p.Medias = append(p.Medias, &core.Media{
 					Kind:      core.KindVideo,
 					Direction: core.DirectionRecvonly,
@@ -180,7 +181,7 @@ func (p *Producer) probe() error {
 							Name:        core.CodecH264,
 							ClockRate:   90000,
 							PayloadType: core.PayloadTypeRAW,
-							FmtpLine:    h264.GetFmtpLine(packet.Data),
+							FmtpLine:    h264.GetFmtpLine(avcc),
 						},
 					},
 				})
