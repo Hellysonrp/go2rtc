@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/xml"
 	"errors"
+	"fmt"
 	"log"
 )
 
@@ -170,46 +171,67 @@ func NewBCMediaPacket(data []byte) (*BCMediaPacket, error) {
 	}, nil
 }
 
-func (bc *BCConn) startStream() *BCStreamReader {
+func (bc *BCConn) startStream(streamKind string) (*BCStreamReader, error) {
+	var streamCode uint8     // header stream type (neolink stream_code): 0=main, 1=sub, 0=extern
+	var previewHandle uint32 // XML Preview.handle (neolink handle): 0=main, 256=sub, 1024=extern
+	var streamType string    // XML streamType: "mainStream", "subStream", "externStream"
+	switch streamKind {
+	case "sub":
+		streamCode = 1
+		previewHandle = 256
+		streamType = "subStream"
+	case "extern":
+		streamCode = 0
+		previewHandle = 1024
+		streamType = "externStream"
+	default:
+		streamCode = 0
+		previewHandle = 0
+		streamType = "mainStream"
+	}
+
 	hdr := Header{
-		Magic:     MagicLE,
-		MessageID: 3,
-		Status:    0,
-		Handle:    1,
-		Channel:   0,
-		Class:     0x6414,
+		Magic:      MagicLE,
+		MessageID:  3,
+		Status:     0,
+		StreamType: streamCode,
+		Channel:    0,
+		Class:      0x6414,
 	}
 
 	var startStreamReq StartStreamReq
 	startStreamReq.Preview.ChannelId = "0"
-	startStreamReq.Preview.Handle = "1"
-	startStreamReq.Preview.StreamType = "mainStream"
+	startStreamReq.Preview.Handle = fmt.Sprintf("%d", previewHandle)
+	startStreamReq.Preview.StreamType = streamType
 	xmlBodyBytes, err := xml.Marshal(startStreamReq)
 	if err != nil {
-		log.Fatalf("Failed to marshal start stream request: %v", err)
+		return nil, fmt.Errorf("marshal start stream request: %w", err)
 	}
 
 	err = bc.aesSend(hdr, nil, xmlBodyBytes)
 	if err != nil {
-		log.Fatalf("Failed to send request: %v", err)
+		return nil, fmt.Errorf("send start stream request: %w", err)
 	}
 
-	streamReader := &BCStreamReader{
-		conn: bc,
-	}
-
-	return streamReader
+	return &BCStreamReader{
+		conn:               bc,
+		expectedStreamType: streamCode,
+	}, nil
 }
 
 type BCStreamReader struct {
-	conn *BCConn
+	conn               *BCConn
+	expectedStreamType uint8
 }
 
-func (r *BCStreamReader) Next() *BCMediaPacket {
+func (r *BCStreamReader) Next() (*BCMediaPacket, error) {
 	var current *[]byte
 
 	for {
 		msg, err := r.conn.readHeaderAndBody()
+		if err != nil {
+			return nil, err
+		}
 		h := msg.header
 		resp := msg.body
 		if h.Status != 200 {
@@ -218,11 +240,14 @@ func (r *BCStreamReader) Next() *BCMediaPacket {
 		if h.MessageID != 3 {
 			continue
 		}
-		if h.Handle != 1 {
+		if h.StreamType != r.expectedStreamType {
 			continue
 		}
 
 		extLen := h.PayloadOffset
+		if extLen > uint32(len(resp)) || h.BodyLength > uint32(len(resp)) {
+			return nil, fmt.Errorf("invalid message bounds")
+		}
 		extBytes := resp[:extLen]
 		payloadBytes := resp[extLen:h.BodyLength]
 
@@ -231,7 +256,7 @@ func (r *BCStreamReader) Next() *BCMediaPacket {
 
 		err = xml.Unmarshal(ext, &extension)
 		if err != nil {
-			log.Fatalf("Failed to unmarshal extension: %v", err)
+			return nil, fmt.Errorf("unmarshal extension: %w", err)
 		}
 
 		var decryptedPayload []byte
@@ -258,7 +283,7 @@ func (r *BCStreamReader) Next() *BCMediaPacket {
 				// Whole packet is contained by this segment
 				// Return the packet
 			} else {
-				return p
+				return p, nil
 			}
 		} else {
 			// if current is nil, there was no binarydata=1 packet
@@ -284,7 +309,7 @@ func (r *BCStreamReader) Next() *BCMediaPacket {
 			}
 
 			// Finally, return the packet
-			return p
+			return p, nil
 		}
 
 	}

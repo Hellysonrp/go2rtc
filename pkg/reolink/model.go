@@ -139,7 +139,7 @@ type StartStreamReq struct {
 		Text       string `xml:",chardata"`
 		Version    string `xml:"version,attr"`
 		ChannelId  string `xml:"channelId"`
-		Handle     string `xml:"handle"`
+		Handle     string `xml:"handle"` // XML preview handle (0=main, 256=sub, 1024=extern per neolink); not the header stream type
 		StreamType string `xml:"streamType"`
 	} `xml:"Preview"`
 }
@@ -151,6 +151,6 @@ type StopStreamReq struct {
 		Text      string `xml:",chardata"`
 		Version   string `xml:"version,attr"`
 		ChannelId string `xml:"channelId"`
-		Handle    string `xml:"handle"`
+		Handle    string `xml:"handle"` // XML preview handle (0=main, 256=sub, 1024=extern per neolink); not the header stream type
 	} `xml:"Preview"`
 }

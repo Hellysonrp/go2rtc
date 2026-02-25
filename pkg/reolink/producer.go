@@ -3,11 +3,13 @@ package reolink
 import (
 	"fmt"
 	"net/url"
+	"strings"
 
 	"github.com/AlexxIT/go2rtc/pkg/aac"
 	"github.com/AlexxIT/go2rtc/pkg/core"
 	"github.com/AlexxIT/go2rtc/pkg/h264"
 	"github.com/AlexxIT/go2rtc/pkg/h264/annexb"
+	"github.com/AlexxIT/go2rtc/pkg/h265"
 	"github.com/pion/rtp"
 )
 
@@ -16,6 +18,7 @@ type Producer struct {
 
 	bcConn       *BCConn
 	streamReader *BCStreamReader
+	streamKind   string
 }
 
 func Dial(source string) (core.Producer, error) {
@@ -27,13 +30,31 @@ func Dial(source string) (core.Producer, error) {
 
 	ip := sourceUrl.Hostname()
 	port := sourceUrl.Port()
+	if port == "" {
+		port = "9000"
+	}
 	username := sourceUrl.User.Username()
 	password, ok := sourceUrl.User.Password()
 	if !ok {
 		return nil, fmt.Errorf("password is required")
 	}
 
-	bcConn := NewBCConn(ip, port, username, password)
+	bcConn, err := NewBCConn(ip, port, username, password)
+	if err != nil {
+		return nil, err
+	}
+
+	streamKind := "main"
+	if q := sourceUrl.Query().Get("stream"); q != "" {
+		switch strings.ToLower(q) {
+		case "sub":
+			streamKind = "sub"
+		case "extern":
+			streamKind = "extern"
+		default:
+			streamKind = "main"
+		}
+	}
 
 	prod := &Producer{
 		Connection: core.Connection{
@@ -45,7 +66,8 @@ func Dial(source string) (core.Producer, error) {
 			URL:        ip,
 			Transport:  bcConn,
 		},
-		bcConn: bcConn,
+		bcConn:     bcConn,
+		streamKind: streamKind,
 	}
 	if err = prod.probe(); err != nil {
 		return nil, err
@@ -55,30 +77,45 @@ func Dial(source string) (core.Producer, error) {
 }
 
 func (p *Producer) Start() error {
-	var video *core.Receiver
+	var video, video265 *core.Receiver
 
 	for _, receiver := range p.Receivers {
 		switch receiver.Codec.Name {
 		case core.CodecH264:
 			video = receiver
+		case core.CodecH265:
+			video265 = receiver
 			// case core.CodecAAC:
 			// 	audio = receiver
 		}
 	}
 
-	// p.streamReader = p.bcConn.startStream()
-
 	for {
-		packet := p.streamReader.Next()
+		packet, err := p.streamReader.Next()
+		if err != nil {
+			return err
+		}
 		switch packet.Codec {
 		case "H264":
-			pkt := &rtp.Packet{
-				Header: rtp.Header{
-					Timestamp: core.Now90000(),
-				},
-				Payload: annexb.EncodeToAVCC(packet.Data),
+			if video != nil {
+				pkt := &rtp.Packet{
+					Header: rtp.Header{
+						Timestamp: core.Now90000(),
+					},
+					Payload: annexb.EncodeToAVCC(packet.Data),
+				}
+				video.Input(pkt)
 			}
-			video.Input(pkt)
+		case "H265":
+			if video265 != nil {
+				pkt := &rtp.Packet{
+					Header: rtp.Header{
+						Timestamp: core.Now90000(),
+					},
+					Payload: annexb.EncodeToAVCC(packet.Data),
+				}
+				video265.Input(pkt)
+			}
 			// case "AAC":
 			// 	pkt := &rtp.Packet{
 			// 		Header: rtp.Header{
@@ -87,7 +124,6 @@ func (p *Producer) Start() error {
 			// 		Payload: packet.Data,
 			// 	}
 			// 	audio.Input(pkt)
-
 		}
 	}
 }
@@ -97,34 +133,73 @@ func (p *Producer) Stop() error {
 	return nil
 }
 
+func (p *Producer) hasVideoCodec(name string) bool {
+	for _, m := range p.Medias {
+		if m.Kind == core.KindVideo && len(m.Codecs) > 0 && m.Codecs[0].Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Producer) hasAudioCodec(name string) bool {
+	for _, m := range p.Medias {
+		if m.Kind == core.KindAudio && len(m.Codecs) > 0 && m.Codecs[0].Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *Producer) probe() error {
 	var packets int
 
-	p.streamReader = p.bcConn.startStream()
+	reader, err := p.bcConn.startStream(p.streamKind)
+	if err != nil {
+		return err
+	}
+	p.streamReader = reader
 
-	for packets != 10 {
-		packet := p.streamReader.Next()
+	for packets < 30 {
+		packet, err := p.streamReader.Next()
+		if err != nil {
+			return err
+		}
 		switch packet.Codec {
 		case "H264":
-			p.Medias = append(p.Medias, &core.Media{
-				Kind:      core.KindVideo,
-				Direction: core.DirectionRecvonly,
-				Codecs: []*core.Codec{
-					{
-						Name:        core.CodecH264,
-						ClockRate:   90000,
-						PayloadType: core.PayloadTypeRAW,
-						FmtpLine:    h264.GetFmtpLine(packet.Data),
+			if !p.hasVideoCodec(core.CodecH264) {
+				p.Medias = append(p.Medias, &core.Media{
+					Kind:      core.KindVideo,
+					Direction: core.DirectionRecvonly,
+					Codecs: []*core.Codec{
+						{
+							Name:        core.CodecH264,
+							ClockRate:   90000,
+							PayloadType: core.PayloadTypeRAW,
+							FmtpLine:    h264.GetFmtpLine(packet.Data),
+						},
 					},
-				},
-			})
+				})
+			}
+		case "H265":
+			avcc := annexb.EncodeToAVCC(packet.Data)
+			if len(avcc) >= 5 && h265.IsKeyframe(avcc) && !p.hasVideoCodec(core.CodecH265) {
+				codec := h265.AVCCToCodec(avcc)
+				p.Medias = append(p.Medias, &core.Media{
+					Kind:      core.KindVideo,
+					Direction: core.DirectionRecvonly,
+					Codecs:    []*core.Codec{codec},
+				})
+			}
 		case "AAC":
-			codec := aac.ConfigToCodec(packet.Data)
-			p.Medias = append(p.Medias, &core.Media{
-				Kind:      core.KindAudio,
-				Direction: core.DirectionRecvonly,
-				Codecs:    []*core.Codec{codec},
-			})
+			if !p.hasAudioCodec(core.CodecAAC) {
+				codec := aac.ConfigToCodec(packet.Data)
+				p.Medias = append(p.Medias, &core.Media{
+					Kind:      core.KindAudio,
+					Direction: core.DirectionRecvonly,
+					Codecs:    []*core.Codec{codec},
+				})
+			}
 		}
 		packets++
 	}

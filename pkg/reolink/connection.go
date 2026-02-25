@@ -2,22 +2,22 @@ package reolink
 
 import (
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 )
 
 const (
 	EncReqAESCam = 0xDC12 // 0xDC12 -> bytes [encrypt=0x12][unknown=0xDC]
+	maxBodySize  = 1 << 20
 )
 
-func NewBCConn(cameraIP, port, username, password string) *BCConn {
+func NewBCConn(cameraIP, port, username, password string) (*BCConn, error) {
 	conn, err := net.Dial("tcp", cameraIP+":"+port)
 	if err != nil {
-		log.Fatalf("Failed to connect: %v", err)
+		return nil, fmt.Errorf("connect: %w", err)
 	}
-	// log.Printf("Connected to camera at %s:%s", cameraIP, port)
 	self := &BCConn{
 		conn:   conn,
 		reader: NewMessageReader(conn),
@@ -25,10 +25,11 @@ func NewBCConn(cameraIP, port, username, password string) *BCConn {
 
 	_, err = self.login(username, password)
 	if err != nil {
-		log.Fatalf("login failed: %v", err)
+		_ = conn.Close()
+		return nil, fmt.Errorf("login: %w", err)
 	}
 
-	return self
+	return self, nil
 }
 
 type BCConn struct {
@@ -64,6 +65,9 @@ func (mr *MessageReader) Next() (BCMsg, error) {
 	if err != nil {
 		return BCMsg{}, fmt.Errorf("parse header failed: %v", err)
 	}
+	if h.BodyLength > maxBodySize {
+		return BCMsg{}, fmt.Errorf("body length %d exceeds maximum (wrong port or non-Baichuan response?)", h.BodyLength)
+	}
 	var body []byte
 	if h.BodyLength > 0 {
 		body = make([]byte, h.BodyLength)
@@ -75,7 +79,7 @@ func (mr *MessageReader) Next() (BCMsg, error) {
 }
 
 func (bc *BCConn) bcSend(header Header, extension []byte, body []byte, bcEncrypt bool) error {
-	header.EncOffset = buildEncOffset(header.Channel, 0, header.Handle)
+	header.EncOffset = buildEncOffset(header.Channel, 0, header.StreamType)
 	if len(extension) > 0 {
 		header.PayloadOffset = uint32(len(extension))
 	}
@@ -113,7 +117,7 @@ func (bc *BCConn) login(username, password string) (ModernLoginRes, error) {
 	header.Magic = MagicLE
 	header.MessageID = 1
 	header.Status = EncReqAESCam
-	header.Handle = 1
+	header.StreamType = 1
 	header.Class = ClassLegacy20
 
 	err := bc.bcSend(header, nil, nil, false)
@@ -122,7 +126,13 @@ func (bc *BCConn) login(username, password string) (ModernLoginRes, error) {
 	}
 	msg, err := bc.readHeaderAndBody()
 	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return ModernLoginRes{}, fmt.Errorf("read legacy reply (AES) failed: %w (wrong port? Reolink Baichuan uses port 9000)", err)
+		}
 		return ModernLoginRes{}, fmt.Errorf("read legacy reply (AES) failed: %w", err)
+	}
+	if msg.header.Magic != MagicLE && msg.header.Magic != MagicBE {
+		return ModernLoginRes{}, fmt.Errorf("invalid legacy reply: magic 0x%08x (is the correct port configured? Reolink Baichuan uses port 9000, not RTSP 554)", msg.header.Magic)
 	}
 	h := msg.header
 	body := msg.body
@@ -154,7 +164,7 @@ func (bc *BCConn) login(username, password string) (ModernLoginRes, error) {
 	header.Magic = MagicLE
 	header.MessageID = 1
 	header.Status = 0
-	header.Handle = 1
+	header.StreamType = 1
 	header.Class = ClassModern24
 
 	err = bc.bcSend(header, nil, xmlBody, true)
@@ -179,7 +189,7 @@ func (bc *BCConn) login(username, password string) (ModernLoginRes, error) {
 }
 
 func (bc *BCConn) aesSend(header Header, extension []byte, body []byte) error {
-	header.EncOffset = buildEncOffset(header.Channel, 0, header.Handle)
+	header.EncOffset = buildEncOffset(header.Channel, 0, header.StreamType)
 	if len(extension) > 0 {
 		header.PayloadOffset = uint32(len(extension))
 	}
