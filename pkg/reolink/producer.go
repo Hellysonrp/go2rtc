@@ -132,7 +132,7 @@ func (p *Producer) Start() error {
 func (p *Producer) Stop() error {
 	streamCode, previewHandle, _ := StreamParams(p.streamKind)
 	_ = stopStream(p.bcConn, streamCode, previewHandle, p.streamMsgNum)
-	return nil
+	return p.Connection.Stop()
 }
 
 func (p *Producer) hasVideoCodec(name string) bool {
@@ -173,17 +173,11 @@ func (p *Producer) probe() error {
 		case "H264":
 			avcc := annexb.EncodeToAVCC(packet.Data)
 			if len(avcc) >= 5 && h264.IsKeyframe(avcc) && !p.hasVideoCodec(core.CodecH264) {
+				codec := h264.AVCCToCodec(avcc)
 				p.Medias = append(p.Medias, &core.Media{
 					Kind:      core.KindVideo,
 					Direction: core.DirectionRecvonly,
-					Codecs: []*core.Codec{
-						{
-							Name:        core.CodecH264,
-							ClockRate:   90000,
-							PayloadType: core.PayloadTypeRAW,
-							FmtpLine:    h264.GetFmtpLine(avcc),
-						},
-					},
+					Codecs:    []*core.Codec{codec},
 				})
 			}
 		case "H265":

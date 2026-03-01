@@ -11,9 +11,9 @@ import (
 
 var ErrInvalidPayloadSize = errors.New("invalid payload size")
 
-func parseIFrame(payload []byte) ([]byte, uint32, uint32, string, error) {
+func parseIFrame(payload []byte) ([]byte, uint32, uint32, string, int, error) {
 	buf := bytes.NewBuffer(payload)
-	_ = buf.Next(4)
+	_ = buf.Next(4) // magic
 	codec := string(buf.Next(4))
 	payloadSize := binary.LittleEndian.Uint32(buf.Next(4))
 	additionalHeader := binary.LittleEndian.Uint32(buf.Next(4))
@@ -30,41 +30,73 @@ func parseIFrame(payload []byte) ([]byte, uint32, uint32, string, error) {
 
 	data := buf.Next(int(payloadSize))
 	if len(data) != int(payloadSize) {
-		return nil, 0, 0, "", ErrInvalidPayloadSize
+		return nil, 0, 0, "", 0, ErrInvalidPayloadSize
 	}
 
-	return data, ms, time, codec, nil
+	// Fixed header: magic(4) + codec(4) + payloadSize(4) + additionalHeader(4) + ms(4) + unknown(4) = 24
+	headerLen := 24 + int(additionalHeader)
+	pad := int(payloadSize) % padSize
+	if pad != 0 {
+		pad = padSize - pad
+	}
+	consumed := headerLen + int(payloadSize) + pad
+	if len(payload) < consumed {
+		return nil, 0, 0, "", 0, ErrInvalidPayloadSize
+	}
+
+	return data, ms, time, codec, consumed, nil
 }
 
-func parsePFrame(payload []byte) ([]byte, uint32, string, error) {
+func parsePFrame(payload []byte) ([]byte, uint32, string, int, error) {
 	buf := bytes.NewBuffer(payload)
-	_ = buf.Next(4)
+	_ = buf.Next(4) // magic
 	codec := string(buf.Next(4))
 	payloadSize := binary.LittleEndian.Uint32(buf.Next(4))
 	additionalHeader := binary.LittleEndian.Uint32(buf.Next(4))
 	ms := binary.LittleEndian.Uint32(buf.Next(4))                   // microseconds
 	_ = binary.LittleEndian.Uint32(buf.Next(4))                     // unknown
-	_ = binary.LittleEndian.Uint32(buf.Next(int(additionalHeader))) //additional header
+	_ = binary.LittleEndian.Uint32(buf.Next(int(additionalHeader)))  // additional header
 
 	data := buf.Next(int(payloadSize))
 	if len(data) != int(payloadSize) {
-		return nil, 0, "", ErrInvalidPayloadSize
+		return nil, 0, "", 0, ErrInvalidPayloadSize
 	}
 
-	return data, ms, codec, nil
+	// Fixed header: magic(4) + codec(4) + payloadSize(4) + additionalHeader(4) + ms(4) + unknown(4) = 24
+	headerLen := 24 + int(additionalHeader)
+	pad := int(payloadSize) % padSize
+	if pad != 0 {
+		pad = padSize - pad
+	}
+	consumed := headerLen + int(payloadSize) + pad
+	if len(payload) < consumed {
+		return nil, 0, "", 0, ErrInvalidPayloadSize
+	}
+
+	return data, ms, codec, consumed, nil
 }
 
-func parseAACFrame(payload []byte) ([]byte, error) {
+func parseAACFrame(payload []byte) ([]byte, int, error) {
 	buf := bytes.NewBuffer(payload)
-	_ = buf.Next(4)
+	_ = buf.Next(4) // magic
 	payloadSize := binary.LittleEndian.Uint16(buf.Next(2))
 	_ = binary.LittleEndian.Uint16(buf.Next(2))
 	data := buf.Next(int(payloadSize))
 	if len(data) != int(payloadSize) {
-		return nil, ErrInvalidPayloadSize
+		return nil, 0, ErrInvalidPayloadSize
 	}
 
-	return data, nil
+	headerLen := 4 + 2 + 2 // 8
+	pad := int(payloadSize) % padSize
+	if pad != 0 {
+		pad = padSize - pad
+	}
+	consumed := headerLen + int(payloadSize) + pad
+	if len(payload) < consumed {
+		return nil, 0, ErrInvalidPayloadSize
+	}
+
+	return data, consumed, nil
 }
 
 type InfoV2 struct {
@@ -119,21 +151,30 @@ type BCMediaPacket struct {
 }
 
 var (
-	iFrameMagic = []byte{0x30, 0x30, 0x64, 0x63}
-	pFrameMagic = []byte{0x30, 0x31, 0x64, 0x63}
 	aacMagic    = []byte{0x30, 0x35, 0x77, 0x62}
 	infoV2Magic = []byte{0x31, 0x30, 0x30, 0x32}
 )
 
-func NewBCMediaPacket(data []byte) (*BCMediaPacket, error) {
+const padSize = 8
+
+const infoV2Consumed = 4 + 4 + 32 // magic + data size + 32-byte info (neolink fixed info size)
+
+func NewBCMediaPacket(data []byte) (*BCMediaPacket, int, error) {
+	if len(data) < 4 {
+		return nil, 0, ErrInvalidPayloadSize
+	}
 	magic := data[:4]
 	var codec string
 	var p []byte
 	var ms uint32
 	var timestamp uint32
+	var consumed int
 	var err error
 	switch {
 	case bytes.Equal(magic, infoV2Magic):
+		if len(data) < infoV2Consumed {
+			return nil, 0, ErrInvalidPayloadSize
+		}
 		codec = "info"
 		info := parseInfoV2(data)
 		return &BCMediaPacket{
@@ -142,24 +183,25 @@ func NewBCMediaPacket(data []byte) (*BCMediaPacket, error) {
 			Microseconds: ms,
 			Timestamp:    timestamp,
 			info:         info,
-		}, nil
+		}, infoV2Consumed, nil
 
-	case bytes.Equal(magic, iFrameMagic):
-		p, ms, timestamp, codec, err = parseIFrame(data)
+	case len(data) >= 4 && data[0] >= 0x30 && data[0] <= 0x39 && data[1] == 0x30 && data[2] == 0x64 && data[3] == 0x63:
+		p, ms, timestamp, codec, consumed, err = parseIFrame(data)
 
-	case bytes.Equal(magic, pFrameMagic):
-		p, ms, codec, err = parsePFrame(data)
+	case len(data) >= 4 && data[0] >= 0x30 && data[0] <= 0x39 && data[1] == 0x31 && data[2] == 0x64 && data[3] == 0x63:
+		p, ms, codec, consumed, err = parsePFrame(data)
 
 	case bytes.Equal(magic, aacMagic):
-		p, err = parseAACFrame(data)
+		p, consumed, err = parseAACFrame(data)
 		codec = "AAC"
 
 	default:
 		log.Printf("Warning: codec magic not supported: %x", magic)
 		p = data
+		consumed = 0
 	}
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	return &BCMediaPacket{
@@ -168,7 +210,7 @@ func NewBCMediaPacket(data []byte) (*BCMediaPacket, error) {
 		Microseconds: ms,
 		Timestamp:    timestamp,
 		info:         nil,
-	}, nil
+	}, consumed, nil
 }
 
 // StreamParams returns streamCode, previewHandle, and streamType for a streamKind (for start/stop).
@@ -290,48 +332,36 @@ func (r *BCStreamReader) Next() (*BCMediaPacket, error) {
 		}
 
 		if extension.BinaryData == 1 {
-			p, err := NewBCMediaPacket(decryptedPayload)
-			// Theres more packets incoming
-			// Reset current, and set current to the segment
+			p, _, err := NewBCMediaPacket(decryptedPayload)
 			if err == ErrInvalidPayloadSize {
 				current = nil
 				current = &decryptedPayload
-
-				// Something else went wrong
-				// Reset current, skip the packet, and continue
 			} else if err != nil {
 				current = nil
 				continue
-
-				// Whole packet is contained by this segment
-				// Return the packet
 			} else {
 				return p, nil
 			}
 		} else {
-			// if current is nil, there was no binarydata=1 packet
-			// before this, therefore nothing to append to, therefore
-			// drop and continue
 			if current == nil {
 				continue
 			}
-			// otherwise append decryptedPayload to current
 			*current = append(*current, decryptedPayload...)
 
-			// try and parse
-			p, err := NewBCMediaPacket(*current)
-
-			// If it's still not the right size, then continue
+			p, consumed, err := NewBCMediaPacket(*current)
 			if err == ErrInvalidPayloadSize {
 				continue
-
-				// Something else has gone wrong, so clear current and continue
 			} else if err != nil {
 				current = nil
 				continue
 			}
 
-			// Finally, return the packet
+			if consumed > 0 {
+				*current = (*current)[consumed:]
+				if len(*current) == 0 {
+					current = nil
+				}
+			}
 			return p, nil
 		}
 
